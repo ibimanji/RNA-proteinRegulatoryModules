@@ -1,0 +1,15 @@
+{
+    "package_name": "pystar_if_registration",
+    "entrypoint": "pystar_if_register_entry",
+    "required_files": [
+      {"name": "pystar_if_register_entry.m", "role": "IF/protein registration entrypoint", "required": true},
+      {"name": "pystar_load_multipage_tiff.m", "role": "multipage TIFF loader", "required": true},
+      {"name": "pystar_dft_register_3d.m", "role": "3D phase correlation registration", "required": true},
+      {"name": "pystar_dft_register_2d.m", "role": "2D phase correlation registration", "required": true},
+      {"name": "pystar_dft_apply_3d.m", "role": "apply 3D Fourier shift", "required": true},
+      {"name": "pystar_dft_apply_2d.m", "role": "apply 2D Fourier shift", "required": true},
+      {"name": "pystar_save_protein_images.m", "role": "registered IF TIFF writer", "required": true}
+    ],
+    "optional_files": []
+  }
+  

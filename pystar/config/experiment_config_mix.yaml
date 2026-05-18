@@ -280,6 +280,7 @@ pipeline:
     # status 是语义成熟度记录。provisional 表示当前约定仍在 benchmark 中持续验证。
     status: "provisional"
 
+
   # ------------------------------------------
   # Stage 0: Preprocessing (预处理)
   # ------------------------------------------
@@ -523,3 +524,19 @@ pipeline:
     correlation_plot:
       dpi: 150            # 输出图片分辨率；论文图可提高，常规 QC 保持 150 足够
       show_threshold: true # 是否在图中显示参考阈值线/辅助线
+      
+  # ------------------------------------------
+  # IF regiatration
+  # ------------------------------------------
+  if_registration:
+    enable: true
+    runtime_path: "matlab_runtime/pystar_if_registration"
+    entrypoint: "pystar_if_register_entry"
+    sample: "14mWT"
+    user_dir: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD"
+    source_data_dir: "01_data"
+    registration_dir: "02_registration"
+    protein_folder: "IF"
+    protein_round: "IF"
+    protein_stains: ["PI", "X34", "amplicon"]
+    registration_channel: 3

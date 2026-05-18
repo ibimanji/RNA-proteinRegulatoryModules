@@ -2,16 +2,23 @@
 
 # =================================================================
 # 自动读取 Config，计算 Array 长度，提交任务
-# 用法: bash scripts/run_pystar.sh [config_path]
+# 用法:
+#   bash scripts/run_pystar.sh [config_path] [main|if|all]
 # =================================================================
 
 set -euo pipefail
 
 CONFIG_FILE="${1:-config/experiment_config.yaml}"
+RUN_MODE="${2:-all}"
 
 # 你的 conda 安装位置
 CONDA_ROOT="$HOME/software/miniconda3"
 CONDA_ENV_NAME="pystar310"
+
+if [[ "$RUN_MODE" != "main" && "$RUN_MODE" != "if" && "$RUN_MODE" != "all" ]]; then
+    echo "Error: RUN_MODE must be one of: main, if, all"
+    exit 1
+fi
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "Error: Config file not found at $CONFIG_FILE"
@@ -25,6 +32,7 @@ fi
 
 echo "--- PyStar Launcher ---"
 echo "Reading config: $CONFIG_FILE"
+echo "Run mode: $RUN_MODE"
 echo "Using conda env: $CONDA_ENV_NAME"
 
 module purge
@@ -58,16 +66,22 @@ if [ "$NUM_JOBS" -eq "0" ]; then
 fi
 
 echo "Detected $NUM_JOBS FOVs to process."
-#mkdir -p logs/pystar
 
-CPUS_PER_FOV=8
-Batch_FOV=127
+mkdir -p logs/pystar
+
+if [ "$RUN_MODE" = "main" ]; then
+    CPUS_PER_FOV=8
+    Batch_FOV=127
+else
+    CPUS_PER_FOV=4
+    Batch_FOV=127
+fi
 
 JOB_ID=$(sbatch << EOF | awk '{print $4}'
 #!/bin/bash
-#SBATCH -J pystar_batch
-#SBATCH -o /dev/null
-#SBATCH -e /dev/null
+#SBATCH -J pystar_${RUN_MODE}
+#SBATCH -o logs/pystar/%x.%A_%a.out
+#SBATCH -e logs/pystar/%x.%A_%a.err
 #SBATCH -p C64M512G
 #SBATCH --qos=normal
 #SBATCH --nodes=1
@@ -79,42 +93,10 @@ JOB_ID=$(sbatch << EOF | awk '{print $4}'
 #SBATCH --no-requeue
 #SBATCH --export=ALL
 
-TASK_LOG_FILE=\$(python -c "
-from pathlib import Path
-import yaml
-
-config_file = '$CONFIG_FILE'
-task_id = int('\$SLURM_ARRAY_TASK_ID')
-
-with open(config_file, encoding='utf-8') as f:
-    data = yaml.safe_load(f)
-
-fovs = data['dataset']['fov_list']
-if isinstance(fovs, str) and '-' in fovs:
-    start, end = map(int, fovs.split('-'))
-    fov_list = list(range(start, end + 1))
-elif isinstance(fovs, str) and ',' in fovs:
-    fov_list = [int(x.strip()) for x in fovs.split(',') if x.strip()]
-elif isinstance(fovs, list):
-    fov_list = [int(x) for x in fovs]
-else:
-    fov_list = [int(fovs)]
-
-output_cfg = data['pipeline']['output']
-export_base = output_cfg.get('export_directory') or output_cfg['directory']
-digits = int(output_cfg.get('export_fov_digits', 3))
-log_name = output_cfg.get('export_log_name', 'log.out')
-
-fov_id = fov_list[task_id - 1]
-log_dir = Path(export_base) / f'Position{fov_id:0{digits}d}'
-log_dir.mkdir(parents=True, exist_ok=True)
-print(log_dir / log_name)
-")
-
-exec > "\$TASK_LOG_FILE" 2>&1
-
 echo "Running on node: \$(hostname)"
 echo "Slurm Task ID: \$SLURM_ARRAY_TASK_ID"
+echo "Run mode: ${RUN_MODE}"
+echo "Config file: ${CONFIG_FILE}"
 
 source "${CONDA_ROOT}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV_NAME}"
@@ -123,10 +105,13 @@ export OMP_NUM_THREADS=${CPUS_PER_FOV}
 export MKL_NUM_THREADS=${CPUS_PER_FOV}
 export OPENBLAS_NUM_THREADS=${CPUS_PER_FOV}
 
-python scripts/batch_pystar.py --config "$CONFIG_FILE" --task_id "\$SLURM_ARRAY_TASK_ID"
+python scripts/batch_pystar.py --config "$CONFIG_FILE" --task_id "\$SLURM_ARRAY_TASK_ID" --mode "${RUN_MODE}"
 
 EOF
 )
 
 echo "Job submitted! ID: $JOB_ID"
 echo "Monitor with: squeue -j $JOB_ID"
+echo "Stage logs:"
+echo "  main/decode: <export_directory>/PositionXXX/decode.log"
+echo "  IF:          <export_directory>/PositionXXX/if.log"
