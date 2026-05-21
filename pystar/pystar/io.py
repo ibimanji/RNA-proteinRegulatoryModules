@@ -2637,7 +2637,7 @@ class ImageLoader:
                 candidates.extend(found)
                 break # 找到了就停止
 
-        if not candidates and round_id == 11 and channel_id == 2:
+        if not candidates and channel_id == 2 and round_id in {5, 11}:
             return Path("__PYSTAR_MISSING_ZERO_CHANNEL__")
 
         if not candidates:

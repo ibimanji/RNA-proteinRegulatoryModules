@@ -866,6 +866,21 @@ class QCConfig(BaseModel):
 
     enable: bool = True
 
+class IFRegistrationConfig(BaseModel):
+    """Optional IF/protein registration stage backed by matlab_runtime."""
+
+    enable: bool = False
+    runtime_path: Path = Path("matlab_runtime/pystar_if_registration")
+    entrypoint: str = "pystar_if_register_entry"
+    sample: str = ""
+    user_dir: str = ""
+    source_data_dir: str = "01_data"
+    registration_dir: str = "02_registration"
+    protein_folder: str = "IF"
+    protein_round: str = "protein_round"
+    protein_stains: List[str] = Field(default_factory=list)
+    registration_channel: int = 3
+
 
 class PipelineConfig(BaseModel):
     """All runnable pipeline-stage configuration.
@@ -886,6 +901,7 @@ class PipelineConfig(BaseModel):
     decoding: DecodingConfig = Field(default_factory=DecodingConfig)
     output: OutputConfig 
     qc: QCConfig
+    if_registration: IFRegistrationConfig = Field(default_factory=IFRegistrationConfig)
 
     @model_validator(mode='after')
     def align_field_semantics(self) -> 'PipelineConfig':
