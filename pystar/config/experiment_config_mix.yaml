@@ -7,7 +7,7 @@ dataset:
   # 原始 TIFF 数据根目录。
   # 作用：ImageLoader 会在这个目录下按 filename_pattern 查找每个 FOV / round / channel 的图像。
   # 调参建议：这是站点路径，不影响算法；换数据集时必须改成你的 raw image 根目录。
-  raw_data_path: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mWT/01_data"
+  raw_data_path: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mFAD/01_data"
 
   # 图像文件名模板。
   # 作用：程序用 raw_data_path + filename_pattern 拼出每张图像的 glob pattern。
@@ -87,7 +87,7 @@ codebook:
   # 基因/条码 CSV 路径。
   # 作用：Decoder 会读取该文件，将每个 gene 的条码编译成可匹配的颜色序列。
   # 换数据集时通常必须改成对应的 genes.csv。
-  gene_list: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mWT/01_data/genes.csv"
+  gene_list: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mFAD/01_data/genes.csv"
 
   # 码本中颜色通道编号的起点。
   # 作用：把 genes.csv 中的颜色编号转换到 PyStar 内部 channel 编号。
@@ -493,9 +493,9 @@ pipeline:
   # Stage 4: Output (输出)
   # ------------------------------------------
   output:
-    directory: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mWT/02_pystar_output"
+    directory: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mFAD/02_pystar_output"
 
-    export_directory: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mWT/02_registration"
+    export_directory: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mFAD/02_registration"
     export_fov_digits: 3
     export_log_name: "log.out"
     export_goodpoints_name: "goodPoints_max3d.csv"
@@ -532,7 +532,7 @@ pipeline:
     enable: true
     runtime_path: "matlab_runtime/pystar_if_registration"
     entrypoint: "pystar_if_register_entry"
-    sample: "14mWT"
+    sample: "14mFAD"
     user_dir: "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD"
     source_data_dir: "01_data"
     registration_dir: "02_registration"
