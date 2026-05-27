@@ -1,0 +1,25 @@
+#!/bin/bash
+#SBATCH -J maskdapi
+#SBATCH -p C64M512G
+#SBATCH -N 1
+#SBATCH -c 32
+#SBATCH -o mask_%A.out
+#SBATCH -e mask_%A.err
+#SBATCH --no-requeue
+
+# Ensure the output directory exists to avoid FileNotFoundError from matplotlib/PIL
+OUTPUT_DIR="/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mWT/05_final"
+mkdir -p "$OUTPUT_DIR"
+
+# Run cellpose_batch.py, as previously
+/gpfs/share/home/2301920002/software/miniconda3/envs/sopa/bin/python cellpose_batch.py \
+-i "/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mWT/04_stitch/IF_registered_channels/PI_registered_stitched.tif" \
+-d cpu \
+-p maskdapi \
+-o "$OUTPUT_DIR" \
+-D 150 \
+-MD cellpose_model \
+-M nucleitorch_0 \
+-C 5 \
+-R 0 \
+-T nuclei
