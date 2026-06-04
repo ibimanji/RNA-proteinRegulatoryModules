@@ -1,0 +1,6 @@
+pandas
+numpy
+scanpy
+anndata
+arboreto
+dask[complete]
