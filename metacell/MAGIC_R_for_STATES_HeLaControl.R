@@ -101,7 +101,7 @@ if (t_diff > 1) {
   for (i in 2:t_diff) {
     M_t <- M_t %*% M
   }
-}#M-C equation
+}#K-C equation
 
 ##test as coefficient ：
 t_max <- 10
