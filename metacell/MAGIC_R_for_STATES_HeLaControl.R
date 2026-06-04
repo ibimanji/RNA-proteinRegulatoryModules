@@ -38,6 +38,7 @@ states_seu <- subset(
 #1.1 we focus on the WT here, to see if it will return the linear biological events(cell cycle related ones， especially the UBE2C、TPX2 related ones)
 #normalize should be carefully considered，here we shall use totalRNA layer to calculate spike-in-factor, to evaluate the cell sequencing-lib
 #With this sequencing-lib, we can use them to normalize rbRNA layer (and ntRNA layer)
+#!!!also seurat-innate normalize function still can be used.Normalization should be carefully considered since it is related to (1)PC calculation(2)D matrix in the data imputing process.
 
 #totalRNA layer as spike in factor
 rna_counts <- GetAssayData(states_seu, assay = "RNA", layer = "counts")
