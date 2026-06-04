@@ -8,8 +8,10 @@ import subprocess
 from pathlib import Path
 
 # 确保能找到 pystar 包
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
+import pystar
 from pystar.infrastructure import load_config
 from pystar.preprocessing import DataSanitizer
 from pystar.registration import RegistrationEngine
@@ -187,6 +189,14 @@ def main():
         logger.info(f" Mode: {args.mode}")
         logger.info(f" Task ID: {args.task_id} / {total_jobs}")
         logger.info(f" Target FOV: {current_fov}")
+        logger.info(f" Config source: {cfg.config_source_path}")
+        logger.info(f" PyStar package: {Path(pystar.__file__).resolve()}")
+        logger.info(f" Repo root: {REPO_ROOT}")
+        logger.info(f" Raw data path: {cfg.dataset.raw_data_path}")
+        logger.info(f" Filename pattern: {cfg.dataset.filename_pattern}")
+        logger.info(f" Output directory: {cfg.pipeline.output.directory}")
+        logger.info(f" Export directory: {cfg.pipeline.output.export_directory}")
+        logger.info(f" Gene list: {cfg.codebook.gene_list}")
         logger.info(f"{'=' * 40}")
 
     start_time_global = time.time()

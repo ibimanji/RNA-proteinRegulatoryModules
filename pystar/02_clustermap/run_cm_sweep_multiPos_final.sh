@@ -16,7 +16,7 @@ PARAM_TSV="${1:-${SCRIPT_DIR}/params.tsv}"
 
 POS_SPEC="${2:-Position001-Position127}"
 
-BASE="/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mFAD"
+BASE="/gpfs/share/home/2301920002/labShare/2301920002/ADdecon/14mWT_14mFAD/14mWT"
 Z_NUM=42
 XY_SIZE=3072
 GENE_CSV="${BASE}/01_data/genes.csv"

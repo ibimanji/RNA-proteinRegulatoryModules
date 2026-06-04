@@ -24,6 +24,13 @@ function metadata_json = pystar_preprocess_entry(input_path, sub_dir, output_dir
 
     entry_timer = tic;
     load_timer = tic;
+    filename_pattern = '';
+    if isfield(config, 'filename_pattern')
+        filename_pattern = config.filename_pattern;
+    end
+    global PYSTAR_LOADER_FILENAME_PATTERN PYSTAR_LOADER_FOV_ID;
+    PYSTAR_LOADER_FILENAME_PATTERN = filename_pattern;
+    PYSTAR_LOADER_FOV_ID = config.fov_id;
     output_imgs = test_LoadImageStacks_zf( ...
         input_path, ...
         sub_dir, ...

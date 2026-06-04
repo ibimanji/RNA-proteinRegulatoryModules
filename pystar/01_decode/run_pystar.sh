@@ -10,6 +10,8 @@ set -euo pipefail
 
 CONFIG_FILE="${1:-config/experiment_config.yaml}"
 RUN_MODE="${2:-all}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # 你的 conda 安装位置
 CONDA_ROOT="$HOME/software/miniconda3"
@@ -25,6 +27,8 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
+CONFIG_FILE="$(cd "$(dirname "$CONFIG_FILE")" && pwd)/$(basename "$CONFIG_FILE")"
+
 if [ ! -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]; then
     echo "Error: conda.sh not found at ${CONDA_ROOT}/etc/profile.d/conda.sh"
     exit 1
@@ -34,6 +38,7 @@ echo "--- PyStar Launcher ---"
 echo "Reading config: $CONFIG_FILE"
 echo "Run mode: $RUN_MODE"
 echo "Using conda env: $CONDA_ENV_NAME"
+echo "Repo root: $REPO_ROOT"
 
 module purge
 module load matlab/2023a
@@ -98,14 +103,17 @@ echo "Slurm Task ID: \$SLURM_ARRAY_TASK_ID"
 echo "Run mode: ${RUN_MODE}"
 echo "Config file: ${CONFIG_FILE}"
 
+cd "${REPO_ROOT}"
+
 source "${CONDA_ROOT}/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV_NAME}"
 
 export OMP_NUM_THREADS=${CPUS_PER_FOV}
 export MKL_NUM_THREADS=${CPUS_PER_FOV}
 export OPENBLAS_NUM_THREADS=${CPUS_PER_FOV}
+export PYTHONPATH="${REPO_ROOT}:\${PYTHONPATH:-}"
 
-python scripts/batch_pystar.py --config "$CONFIG_FILE" --task_id "\$SLURM_ARRAY_TASK_ID" --mode "${RUN_MODE}"
+python "${REPO_ROOT}/01_decode/batch_pystar.py" --config "$CONFIG_FILE" --task_id "\$SLURM_ARRAY_TASK_ID" --mode "${RUN_MODE}"
 
 EOF
 )

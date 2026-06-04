@@ -1,4 +1,5 @@
 import hashlib
+import re
 import yaml
 from pathlib import Path
 from typing import List, Dict, Union, Any, Optional, Literal, Tuple
@@ -62,6 +63,108 @@ def parse_range_string(s: Union[str, int, List[int]]) -> List[int]:
         except (ValueError, AttributeError):
             raise ValueError(f"Invalid FOV range format: '{s}'. Use list or 'start-end' string.")
     raise ValueError(f"Unknown type for fov_list: {type(s)}")
+
+
+_TEMPLATE_PATTERN = re.compile(r"\{([^{}]+)\}")
+
+
+def _format_config_string(value: str, variables: Dict[str, Any]) -> str:
+    """Expand simple YAML placeholders such as ``{dataset_base}``.
+
+    This intentionally stays smaller than a template engine: it supports
+    top-level scalar config values plus the path filters already used in the
+    experiment YAML comments.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        expression = match.group(1).strip()
+        parts = [part.strip() for part in expression.split("|")]
+        name = parts[0]
+        if name not in variables:
+            return match.group(0)
+
+        rendered = str(variables[name])
+        for filter_name in parts[1:]:
+            if filter_name == "basename":
+                rendered = Path(rendered).name
+            elif filter_name == "dirname":
+                rendered = str(Path(rendered).parent)
+            else:
+                return match.group(0)
+        return rendered
+
+    return _TEMPLATE_PATTERN.sub(replace, value)
+
+
+def _expand_config_templates(value: Any, variables: Dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _expand_config_templates(item, variables)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_expand_config_templates(item, variables) for item in value]
+    if isinstance(value, str):
+        return _format_config_string(value, variables)
+    return value
+
+
+def _resolve_config_path(raw_path: Any, *, config_dir: Path) -> Any:
+    if raw_path is None:
+        return None
+    if not isinstance(raw_path, (str, Path)):
+        return raw_path
+
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = config_dir / path
+    return str(path.resolve())
+
+
+def _set_nested_config_path(raw_data: Dict[str, Any], keys: Tuple[str, ...], *, config_dir: Path) -> None:
+    current: Any = raw_data
+    for key in keys[:-1]:
+        if not isinstance(current, dict) or key not in current:
+            return
+        current = current[key]
+
+    final_key = keys[-1]
+    if isinstance(current, dict) and final_key in current:
+        current[final_key] = _resolve_config_path(current[final_key], config_dir=config_dir)
+
+
+def _prepare_config_data(raw_data: Any, *, config_path: Path) -> Any:
+    if not isinstance(raw_data, dict):
+        return raw_data
+
+    config_dir = config_path.resolve().parent
+    repo_root = Path(__file__).resolve().parents[1]
+    variables = {
+        key: value
+        for key, value in raw_data.items()
+        if isinstance(key, str) and isinstance(value, (str, int, float, bool))
+    }
+    variables.setdefault("config_dir", str(config_dir))
+    variables.setdefault("repo_root", str(repo_root))
+
+    if isinstance(variables.get("dataset_base"), str):
+        variables["dataset_base"] = _resolve_config_path(
+            variables["dataset_base"],
+            config_dir=config_dir,
+        )
+
+    expanded = _expand_config_templates(raw_data, variables)
+
+    for path_keys in (
+        ("dataset", "raw_data_path"),
+        ("codebook", "gene_list"),
+        ("pipeline", "output", "directory"),
+        ("pipeline", "output", "export_directory"),
+        ("pipeline", "if_registration", "user_dir"),
+    ):
+        _set_nested_config_path(expanded, path_keys, config_dir=config_dir)
+
+    return expanded
 
 # --- Pydantic Models (数据校验) ---
 
@@ -1097,6 +1200,7 @@ def load_config(config_path: str) -> ExperimentConfig:
     except yaml.YAMLError as e:
         raise ValueError(f"Invalid YAML format: {e}")
 
+    raw_data = _prepare_config_data(raw_data, config_path=path)
     _validate_release_facing_fields(raw_data)
 
     try:
