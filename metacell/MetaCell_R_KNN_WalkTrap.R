@@ -202,7 +202,7 @@ mc_centroids <- plot_data_mc %>%
     UMAP_2 = mean(UMAP_2),
     Size   = n(),
     .groups = "drop"
-  )#mc_UMAP坐标为改集合内所有
+  )#mc_UMAP坐标为改集合内所有cell UMAP坐标均值
 
 p_supercell <- ggplot() +
   geom_point(
