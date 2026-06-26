@@ -1,0 +1,1084 @@
+rm(list = ls()); gc(); options(stringsAsFactors = FALSE)
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(dplyr)
+  library(Seurat)
+  library(FNN)
+  library(RSpectra)
+  library(ggplot2)
+  library(ggrepel)
+  library(harmony)
+})
+
+`%||%` <- function(x, y) {
+  if (is.null(x)) y else x
+}
+
+assert_named_list <- function(x, arg = "x") {
+  if (!is.list(x) || is.null(names(x)) || any(names(x) == "")) {
+    stop(arg, " must be a named list.", call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+row_normalize <- function(x, eps = 1e-10) {
+  denom <- sqrt(rowSums(x^2))
+  denom[denom < eps] <- 1 #maintaining the x while the weight is relatively small
+  sweep(x, 1, denom, "/")
+}
+
+get_assay_matrix <- function(seurat_obj, assay, layer = "counts") {
+  tryCatch(
+    GetAssayData(seurat_obj, assay = assay, layer = layer),
+    error = function(e) GetAssayData(seurat_obj, assay = assay, slot = layer)
+  )
+}
+
+set_assay_matrix <- function(seurat_obj, assay, layer = "data", value) {
+  tryCatch(
+    SetAssayData(seurat_obj, assay = assay, layer = layer, new.data = value),
+    error = function(e) SetAssayData(seurat_obj, assay = assay, slot = layer, new.data = value)
+  )
+}
+
+validate_embedding_list <- function(embeddings) {
+  assert_named_list(embeddings, "embeddings")
+  n_cells <- vapply(embeddings, nrow, integer(1))
+  if (length(unique(n_cells)) != 1) {
+    stop("All embedding layers must have the same number of rows/cells.", call. = FALSE)
+  }
+  
+  row_ids <- lapply(embeddings, rownames)
+  has_all_ids <- all(vapply(row_ids, function(z) !is.null(z), logical(1)))
+  if (has_all_ids) {
+    ref <- row_ids[[1]]
+    ok <- vapply(row_ids, identical, logical(1), y = ref)
+    if (!all(ok)) {
+      stop("All embedding layers must use the same rownames in the same order.", call. = FALSE)
+    }
+  }
+  
+  invisible(TRUE)
+}
+
+build_knn_graph <- function(emb, k = 30, symmetrize = c("max", "mean"), sigma_floor = 1e-6) {
+  symmetrize <- match.arg(symmetrize)
+  emb <- as.matrix(emb)
+  if (nrow(emb) <= k) {
+    stop("k must be smaller than the number of cells/vertices.", call. = FALSE)
+  }
+  if (any(!is.finite(emb))) {
+    stop("Embedding contains NA/NaN/Inf values.", call. = FALSE)
+  }
+  
+  knn <- FNN::get.knn(emb, k = k)
+  idx <- knn$nn.index
+  dst <- knn$nn.dist
+  n <- nrow(idx)
+  
+  sigma <- dst[, k]#here kth in the k-NN's K is borrowed as sigma, we can change this but this function is fast.
+  sigma[sigma < sigma_floor] <- sigma_floor
+  
+  ii <- rep(seq_len(n), each = k)
+  jj <- as.vector(t(idx))
+  d <- as.vector(t(dst))
+  
+  sigma_i <- rep(sigma, each = k)
+  sigma_j <- sigma[jj]
+  w <- exp(-(d^2) / (sigma_i * sigma_j))
+  
+  W <- sparseMatrix(i = ii, j = jj, x = w, dims = c(n, n))
+  W <- switch(
+    symmetrize,
+    max = pmax(W, t(W)),
+    mean = (W + t(W)) / 2
+  )
+  diag(W) <- 0
+  drop0(W)
+}
+
+compute_normalized_laplacian <- function(W, eps = 1e-10) {
+  W <- as(W, "dgCMatrix")
+  deg <- Matrix::rowSums(W)
+  Dinv <- Diagonal(x = 1 / sqrt(deg + eps))
+  Diagonal(nrow(W)) - Dinv %*% W %*% Dinv
+}
+
+get_laplacian_subspace <- function(L, ndim = 30) {
+  if (ndim >= nrow(L)) {
+    stop("ndim must be smaller than the number of cells/vertices.", call. = FALSE)
+  }
+  
+  eig <- RSpectra::eigs_sym(L, k = ndim, which = "SM")
+  U <- qr.Q(qr(eig$vectors))
+  list(U = U, values = eig$values)
+}
+
+resolve_layer_values <- function(values, layer_names, default_value, spatial_value = NULL, arg = "values") {
+  #this is for layer weight, especially for spatial layer
+  if (is.null(values)) {
+    out <- rep(default_value, length(layer_names))
+    names(out) <- layer_names
+  } else if (length(values) == 1 && is.null(names(values))) {
+    out <- rep(as.numeric(values), length(layer_names))
+    names(out) <- layer_names
+  } else {
+    out <- rep(default_value, length(layer_names))
+    names(out) <- layer_names
+    values <- unlist(values)
+    if (is.null(names(values)) || any(names(values) == "")) {
+      if (length(values) != length(layer_names)) {
+        stop(arg, " must be length 1, length equal to layers, or named by layer.", call. = FALSE)
+      }
+      out[] <- as.numeric(values)
+    } else {
+      missing_names <- setdiff(names(values), layer_names)
+      if (length(missing_names) > 0) {
+        stop(arg, " contains unknown layer(s): ", paste(missing_names, collapse = ", "), call. = FALSE)
+      }
+      out[names(values)] <- as.numeric(values)
+    }
+  }
+  
+  if (!is.null(spatial_value)) {
+    spatial_layers <- grepl("spatial|space|coord|location", layer_names, ignore.case = TRUE)
+    implicit_values <- is.null(values) || (length(values) == 1 && is.null(names(values)))
+    if (any(spatial_layers) && implicit_values) {
+      out[spatial_layers] <- spatial_value
+    }
+  }
+  
+  if (any(!is.finite(out))) {
+    stop(arg, " must contain finite numeric values.", call. = FALSE)
+  }
+  out
+}
+
+run_scml_core <- function(
+    graph_list,
+    ndim = 30,
+    alpha = NULL,
+    layer_weight = NULL,
+    default_alpha = 1.0,
+    spatial_alpha = 0,
+    return_laplacians = TRUE) {
+  assert_named_list(graph_list, "graph_list")
+  
+  layer_names <- names(graph_list)
+  n_vertices <- vapply(graph_list, nrow, integer(1))
+  if (length(unique(n_vertices)) != 1 || any(vapply(graph_list, ncol, integer(1)) != n_vertices[1])) {
+    stop("All graphs must be square matrices with the same dimensions.", call. = FALSE)
+  }
+  
+  alpha_vec <- resolve_layer_values(
+    alpha,
+    layer_names,
+    default_value = default_alpha,
+    spatial_value = spatial_alpha,
+    arg = "alpha"
+  )
+  weight_vec <- resolve_layer_values(
+    layer_weight,
+    layer_names,
+    default_value = 1,
+    spatial_value = NULL,
+    arg = "layer_weight"
+  )
+  cat("\n========== Layer Parameters ==========\n")
+  
+  print(
+    data.frame(
+      layer = layer_names,
+      weight = as.numeric(weight_vec[layer_names]),
+      alpha = as.numeric(alpha_vec[layer_names]),
+      row.names = NULL
+    )
+  )
+  
+  n <- n_vertices[1]
+  L_sum <- Matrix(0, n, n, sparse = TRUE)
+  P_sum <- Matrix(0, n, n, sparse = TRUE)
+  
+  U_layers <- list()
+  eig_layers <- list()
+  laplacians <- list()
+  
+  for (layer in layer_names) {
+    L <- compute_normalized_laplacian(graph_list[[layer]])
+    subspace <- get_laplacian_subspace(L, ndim = ndim)
+    
+    U_layers[[layer]] <- subspace$U
+    eig_layers[[layer]] <- subspace$values
+    if (return_laplacians) {
+      laplacians[[layer]] <- L
+    }
+    
+    L_sum <- L_sum + weight_vec[[layer]] * L
+    P_sum <- P_sum + alpha_vec[[layer]] * tcrossprod(subspace$U)
+  }
+  
+  L_modified <- L_sum - P_sum
+  eig_consensus <- RSpectra::eigs_sym(L_modified, k = ndim, which = "SM")
+  U_consensus <- row_normalize(eig_consensus$vectors)
+  colnames(U_consensus) <- paste0("SCML_", seq_len(ncol(U_consensus)))
+  
+  list(
+    U = U_consensus,
+    eigenvalues = eig_consensus$values,
+    U_layers = U_layers,
+    eigenvalues_layers = eig_layers,
+    L_modified = L_modified,
+    laplacians = if (return_laplacians) laplacians else NULL,
+    alpha = alpha_vec,
+    layer_weight = weight_vec
+  )
+}
+
+run_scml_from_embeddings <- function(
+    embeddings,
+    k = 30,
+    ndim = 30,
+    alpha = NULL,
+    layer_weight = NULL,
+    default_alpha = 1,
+    spatial_alpha = 0,
+    symmetrize = "max",
+    return_graphs = TRUE) {
+  validate_embedding_list(embeddings)
+  
+  graph_list <- lapply(
+    embeddings,
+    build_knn_graph,
+    k = k,
+    symmetrize = symmetrize
+  )
+  
+  result <- run_scml_core(
+    graph_list = graph_list,
+    ndim = ndim,
+    alpha = alpha,
+    layer_weight = layer_weight,
+    default_alpha = default_alpha,
+    spatial_alpha = spatial_alpha
+  )
+  
+  if (!is.null(rownames(embeddings[[1]]))) {
+    rownames(result$U) <- rownames(embeddings[[1]])
+  }
+  result$graphs <- if (return_graphs) graph_list else NULL
+  result$embeddings_input <- embeddings
+  result
+}
+
+################################
+##1. STATES multimodal problem##
+################################
+states <- read_h5ad("/media/zenglab/result/lingyuan/STEM/decon/celltype_annotation/mousebrain_combine_20260612.h5ad")
+rb_raw_mat <- t(states$layers[["rbRNA_raw"]]) 
+total_raw_mat <- t(states$layers[["totalRNA_raw"]])
+nt_raw_mat <- t(states$layers[["ntRNA_raw"]])
+meta = states$obs
+states_seu <- CreateSeuratObject(
+  counts = total_raw_mat,
+  meta.data = meta,
+  project = "statesmouse"
+)
+states_seu[["rbRNA"]] <- CreateAssayObject(
+  counts = rb_raw_mat
+)
+states_seu[["ntRNA"]] <- CreateAssayObject(
+  counts = nt_raw_mat
+)
+
+states_seu <- subset(states_seu, subset = type == "14mWT")
+
+cat("Running RNA normalization...\n")
+
+DefaultAssay(states_seu) <- "RNA"
+
+rna_counts <- GetAssayData(
+  states_seu,
+  assay = "RNA",
+  layer = "counts"
+)
+
+rna_lib_sizes <- colSums(rna_counts)
+
+states_seu <- NormalizeData(
+  states_seu,
+  normalization.method = "RC",
+  scale.factor = median(rna_lib_sizes)
+)
+
+states_seu <- FindVariableFeatures(
+  states_seu,
+  selection.method = "vst",
+  nfeatures = 2000
+)
+
+states_seu <- ScaleData(states_seu)
+
+states_seu <- RunPCA(
+  states_seu,
+  npcs = 50,
+  reduction.name = "rna.pca",
+  reduction.key = "rnaPC_"
+)
+
+############################################################
+## 2. rbRNA normalization
+############################################################
+
+cat("Running rbRNA normalization...\n")
+
+rb_counts <- GetAssayData(
+  states_seu,
+  assay = "rbRNA",
+  layer = "counts"
+)
+
+scale_factor_ref_rb <- median(
+  colSums(rb_counts)
+)
+
+rb_norm <- sweep(
+  rb_counts,
+  2,
+  rna_lib_sizes,
+  "/"
+) * scale_factor_ref_rb
+
+states_seu <- SetAssayData(
+  states_seu,
+  assay = "rbRNA",
+  layer = "data",
+  new.data = as(rb_norm, "dgCMatrix")
+)
+
+states_seu <- FindVariableFeatures(
+  states_seu,
+  assay = "rbRNA",
+  selection.method = "vst",
+  nfeatures = 2000
+)
+
+states_seu <- ScaleData(
+  states_seu,
+  assay = "rbRNA"
+)
+
+states_seu <- RunPCA(
+  states_seu,
+  assay = "rbRNA",
+  npcs = 50,
+  reduction.name = "rbrna.pca",
+  reduction.key = "rbrnaPC_"
+)
+
+############################################################
+## 3. ntRNA normalization
+############################################################
+
+cat("Running ntRNA normalization...\n")
+
+nt_counts <- GetAssayData(
+  states_seu,
+  assay = "ntRNA",
+  layer = "counts"
+)
+
+scale_factor_ref_nt <- median(
+  colSums(nt_counts)
+)
+
+nt_norm <- sweep(
+  nt_counts,
+  2,
+  rna_lib_sizes,
+  "/"
+) * scale_factor_ref_nt
+
+states_seu <- SetAssayData(
+  states_seu,
+  assay = "ntRNA",
+  layer = "data",
+  new.data = as(nt_norm, "dgCMatrix")
+)
+
+states_seu <- FindVariableFeatures(
+  states_seu,
+  assay = "ntRNA",
+  selection.method = "vst",
+  nfeatures = 2000
+)
+
+states_seu <- ScaleData(
+  states_seu,
+  assay = "ntRNA"
+)
+
+states_seu <- RunPCA(
+  states_seu,
+  assay = "ntRNA",
+  npcs = 50,
+  reduction.name = "ntrna.pca",
+  reduction.key = "ntrnaPC_"
+)
+
+############################################################
+## 4. Harmony integration
+############################################################
+
+cat("Running Harmony on rbRNA...\n")
+
+states_seu <- RunHarmony(
+  object = states_seu,
+  group.by.vars = "batch",
+  reduction.use = "rbrna.pca",
+  reduction.save = "rbrna.harmony",
+  verbose = TRUE
+)
+
+cat("Running Harmony on ntRNA...\n")
+
+states_seu <- RunHarmony(
+  object = states_seu,
+  group.by.vars = "batch",
+  reduction.use = "ntrna.pca",
+  reduction.save = "ntrna.harmony",
+  verbose = TRUE
+)
+
+############################################################
+## 5. Extract Harmony embeddings
+############################################################
+
+Emb_rb <- Embeddings(
+  states_seu,
+  reduction = "rbrna.harmony"
+)[,1:30]
+
+Emb_nt <- Embeddings(
+  states_seu,
+  reduction = "ntrna.harmony"
+)[,1:30]
+
+############################################################
+## 6. Build expression graphs (global)
+############################################################
+
+cat("Building rbRNA graph...\n")
+
+W_rb <- build_knn_graph(
+  emb = Emb_rb,
+  k = 30, symmetrize = 'mean'
+)
+
+cat("Building ntRNA graph...\n")
+
+W_nt <- build_knn_graph(
+  emb = Emb_nt,
+  k = 30, symmetrize = 'mean'
+)
+
+############################################################
+## 7. Build spatial graph
+## sample-specific
+############################################################
+
+cat("Building spatial graph...\n")
+
+batch_ids <- unique(
+  as.character(states_seu$batch)
+)
+
+W_spatial_list <- vector(
+  "list",
+  length(batch_ids)
+)
+
+names(W_spatial_list) <- batch_ids
+
+for(sample_id in batch_ids){
+  
+  cat("Spatial graph:", sample_id, "\n")
+  
+  cells_use <- colnames(states_seu)[
+    states_seu$batch == sample_id
+  ]
+  
+  coords <- states_seu@meta.data[
+    cells_use,
+    c("column","row")
+  ]
+  
+  coords <- as.matrix(coords)
+  
+  rownames(coords) <- cells_use
+  
+  W_spatial_list[[sample_id]] <- build_knn_graph(
+    emb = coords,
+    k = 30
+  )
+}
+
+############################################################
+## block diagonal spatial graph
+############################################################
+
+W_spatial <- as(
+  bdiag(W_spatial_list),
+  "dgCMatrix"
+)
+
+############################################################
+## sanity check
+############################################################
+
+stopifnot(
+  nrow(W_spatial) == ncol(states_seu)
+)
+
+stopifnot(
+  nrow(W_rb) == ncol(states_seu)
+)
+
+stopifnot(
+  nrow(W_nt) == ncol(states_seu)
+)
+
+############################################################
+## 8. Run SCML
+############################################################
+
+cat("Running SCML...\n")
+
+scml_result <- run_scml_core(
+  graph_list = list(
+    ntRNA   = W_nt,
+    rbRNA   = W_rb,
+    spatial = W_spatial
+  ),
+  ndim = 30,
+  default_alpha = 1,
+  spatial_alpha = 0.0
+)
+
+############################################################
+## 9. Store SCML embedding
+############################################################
+
+SCML_embedding <- scml_result$U
+
+rownames(SCML_embedding) <- colnames(states_seu)
+
+states_seu[["scml"]] <- CreateDimReducObject(
+  embeddings = SCML_embedding,
+  key = "SCML_",
+  assay = "RNA"
+)
+
+BuildSCMLGraph <- build_knn_graph
+ComputeGraphSpectrum <- function(
+    W,
+    n_eigs = 300
+){
+  
+  D <- Matrix::rowSums(W)
+  
+  D_inv <- Diagonal(
+    x = 1/sqrt(D+1e-8)
+  )
+  
+  L <- Diagonal(nrow(W)) -
+    D_inv %*%
+    W %*%
+    D_inv
+  
+  eig <- eigs_sym(
+    L,
+    k=n_eigs,
+    which="SM"
+  )
+  
+  list(
+    lambda=eig$values,
+    V=eig$vectors
+  )
+}
+W <- BuildSCMLGraph(SCML_embedding,k=30)
+
+spec <- ComputeGraphSpectrum(
+  W,
+  n_eigs=400
+)
+
+lambda <- spec$lambda
+df <- data.frame(
+  idx = seq_along(lambda),
+  lambda = sort(lambda)
+)
+
+ggplot(
+  df,
+  aes(idx, lambda)
+) +
+  geom_line() +
+  geom_point(size = 1) +
+  theme_classic()
+lambda_sort <- sort(lambda)
+
+cum_energy <- cumsum(lambda_sort) /
+  sum(lambda_sort)
+
+plot(
+  cum_energy,
+  type = "l",
+  lwd = 2,
+  ylim = c(0,1),
+  ylab = "Cumulative Energy",
+  xlab = "Eigenvalue Rank"
+)
+
+abline(
+  h = c(0.8,0.9,0.95),
+  lty = 2
+)
+V <- spec$V
+WaveletKernel <- function(
+    lambda,
+    scale = 5
+){
+  
+  scale * lambda *
+    exp(-scale * lambda)
+  
+}
+GraphFilterKernel <- function(
+    lambda,
+    type = c(
+      "heat",
+      "tikhonov",
+      "exponential",
+      "wavelet",
+      "bandpass",
+      "ideal",
+      "butterworth",
+      "hybrid"
+    ),
+    beta = 1,
+    scale = 5,
+    lambda_low = 0.1,
+    lambda_high = 1,
+    lambda_c = 0.4,
+    order = 4,
+    gamma = 0.25
+){
+  
+  type <- match.arg(type)
+  
+  g <- switch(
+    
+    type,
+    
+    ########################################################
+    ## Heat kernel
+    ########################################################
+    
+    heat =
+      exp(
+        -beta * lambda
+      ),
+    
+    ########################################################
+    ## Tikhonov
+    ########################################################
+    
+    tikhonov =
+      1 /
+      (
+        1 +
+          beta * lambda
+      ),
+    
+    ########################################################
+    ## Exponential
+    ########################################################
+    
+    exponential =
+      exp(
+        -beta * sqrt(lambda)
+      ),
+    
+    ########################################################
+    ## Spectral graph wavelet
+    ########################################################
+    
+    wavelet =
+      lambda *
+      exp(
+        -scale * lambda
+      ),
+    
+    ########################################################
+    ## Band-pass
+    ########################################################
+    
+    bandpass =
+      as.numeric(
+        lambda > lambda_low &
+          lambda < lambda_high
+      ),
+    
+    ########################################################
+    ## Ideal low-pass
+    ########################################################
+    
+    ideal =
+      as.numeric(
+        lambda < beta
+      ),
+    
+    ########################################################
+    ## Butterworth low-pass
+    ########################################################
+    
+    butterworth =
+      1 /
+      (
+        1 +
+          (lambda / lambda_c)^(2 * order)
+      ),
+    
+    ########################################################
+    ## Hybrid:
+    ## Heat + Wavelet
+    ########################################################
+    
+    hybrid =
+      exp(
+        -beta * lambda
+      ) +
+      gamma *
+      lambda *
+      exp(
+        -scale * lambda
+      )
+    
+  )
+  
+  ##########################################################
+  ## Normalize
+  ##########################################################
+  
+  g <- g / max(g)
+  
+  g
+  
+}
+GraphWaveletDenoise <- function(
+    expr,
+    V,
+    g
+){
+  
+  g <- g
+  
+  X <- t(as.matrix(expr))
+  
+  X_hat <- t(V) %*% X
+  
+  X_hat_filt <- g * X_hat
+  
+  X_filt <- V %*% X_hat_filt
+  
+  X_filt[X_filt < 0] <- 0
+  
+  t(X_filt)
+}
+
+g_heat <- GraphFilterKernel(
+  lambda = lambda,
+  type = "heat",
+  beta = 3
+)
+
+rb_wavelet <- GraphWaveletDenoise(
+  expr = rb_norm,
+  V = V,
+  g = g_heat
+)
+colnames(rb_wavelet) <- colnames(rb_norm)
+all.equal(rownames(rb_wavelet),rownames(rb_norm))
+
+nt_wavelet <- GraphWaveletDenoise(
+  expr = nt_norm,
+  V = V,
+  g = g_heat
+)
+colnames(nt_wavelet) <- colnames(nt_norm)
+all.equal(rownames(nt_wavelet),rownames(nt_norm))
+
+totalRNA_norm <- GetAssayData(states_seu, layer = 'data',assay = 'RNA')
+total_wavelet <- GraphWaveletDenoise(
+  expr = totalRNA_norm,
+  V = V,
+  g = g_heat
+)
+colnames(total_wavelet) <- colnames(totalRNA_norm)
+states_seu[["rb_wavelet"]] <-
+  CreateAssayObject(
+    counts =  rb_wavelet
+  )
+
+states_seu[["nt_wavelet"]] <-
+  CreateAssayObject(
+    counts = nt_wavelet
+  )
+states_seu[["total_wavelet"]] <-
+  CreateAssayObject(
+    counts = total_wavelet
+  )
+
+scale_color_gradientn(
+  colours = c(
+    "white",
+    "#FEE8C8",
+    "#FDBB84",
+    "#E34A33",
+    "#B30000"
+  )
+)
+
+
+############################################################
+## Build matrices
+############################################################
+
+total_norm <- GetAssayData(states_seu, assay = 'RNA', layer = 'data')
+total_raw = GetAssayData(states_seu, assay = 'RNA', layer = 'counts')
+rb_raw = GetAssayData(states_seu, assay = 'rbRNA', layer = 'counts')
+
+te_raw <- rb_raw / (total_raw + 1e-6)
+te_wave <- rb_wavelet / (total_wavelet + 1e-6)
+
+tau <- apply(
+  total_wavelet,
+  1,
+  function(x)
+    quantile(
+      x,
+      0.75
+    )
+)
+
+weight <- total_wavelet
+
+for(i in seq_len(nrow(total_wavelet))){
+  
+  weight[i, ] <-
+    total_wavelet[i, ] /
+    (
+      total_wavelet[i, ] +
+        tau[i]
+    )
+  
+}
+
+te_wave <- te_wave * weight
+############################################################
+## Assays
+############################################################
+
+states_tmp <- states_seu
+
+states_tmp[["total_raw_tmp"]] <-
+  CreateAssayObject(
+    counts = total_norm
+  )
+
+states_tmp[["total_wave_tmp"]] <-
+  CreateAssayObject(
+    counts = total_wavelet
+  )
+
+states_tmp[["te_raw_tmp"]] <-
+  CreateAssayObject(
+    counts = te_raw
+  )
+
+states_tmp[["te_wave_tmp"]] <-
+  CreateAssayObject(
+    counts = te_wave
+  )
+PlotSpatialGene2 <- function(
+    seu,
+    gene,
+    assay,
+    vmax,
+    title = NULL,
+    point_size = 1
+){
+  
+  expr <- FetchData(
+    seu,
+    vars = gene,
+    assay = assay
+  )[,1]
+  
+  expr_plot <- pmin(expr, vmax)
+  
+  df <- data.frame(
+    row  = seu$row,
+    col  = seu$column,
+    expr = expr_plot
+  )
+  
+  ggplot(
+    df,
+    aes(
+      x = col,
+      y = -row,
+      color = expr
+    )
+  ) +
+    geom_point(size = point_size) +
+    scale_color_gradientn(
+      colours = c(
+        "white",
+        "#FEE8C8",
+        "#FDBB84",
+        "#E34A33",
+        "#B30000"
+      ),
+      limits = c(0, vmax),
+      oob = scales::squish
+    ) +
+    coord_fixed() +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    ) +
+    labs(
+      title = title,
+      color = gene
+    )
+}
+
+############################################################
+## Helper: gene-specific vmax (NO shared vmax anymore)
+############################################################
+
+GetVmax <- function(mat, gene, qmax = 0.99){
+  
+  quantile(
+    mat[gene, ],
+    probs = qmax,
+    na.rm = TRUE
+  )
+}
+
+############################################################
+## Marker genes
+############################################################
+
+genes_use <- c(
+  "Nrgn","C1ql2","Wfs1","Chgb",
+  "Mbp","Plp1","C1qa","Hexb","Pvalb",
+  "Enpp2","Ttr",
+  "Ly6c1","Rarres2","Ptgds"
+)
+
+############################################################
+## Total RNA
+############################################################
+
+plot_total <- list()
+
+for(gene in genes_use){
+  
+  vmax_raw  <- GetVmax(total_raw, gene)
+  vmax_wave <- GetVmax(total_wavelet, gene)
+  
+  plot_total[[length(plot_total)+1]] <-
+    PlotSpatialGene2(
+      states_tmp,
+      gene = gene,
+      assay = "total_raw_tmp",
+      vmax = vmax_raw,
+      title = paste0(gene, "\nTotal Raw")
+    )
+  
+  plot_total[[length(plot_total)+1]] <-
+    PlotSpatialGene2(
+      states_tmp,
+      gene = gene,
+      assay = "total_wave_tmp",
+      vmax = vmax_wave,
+      title = paste0(gene, "\nTotal Wavelet")
+    )
+}
+
+p_total <- wrap_plots(plot_total, ncol = 2) +
+  plot_annotation(title = "Total RNA (ntRNA + rbRNA)")
+
+############################################################
+## TE
+############################################################
+
+plot_te <- list()
+
+for(gene in genes_use){
+  
+  vmax_raw  <- GetVmax(te_raw, gene)
+  vmax_wave <- GetVmax(te_wave, gene)
+  
+  plot_te[[length(plot_te)+1]] <-
+    PlotSpatialGene2(
+      states_tmp,
+      gene = gene,
+      assay = "te_raw_tmp",
+      vmax = vmax_raw,
+      title = paste0(gene, "\nTE Raw")
+    )
+  
+  plot_te[[length(plot_te)+1]] <-
+    PlotSpatialGene2(
+      states_tmp,
+      gene = gene,
+      assay = "te_wave_tmp",
+      vmax = vmax_wave,
+      title = paste0(gene, "\nTE Wavelet")
+    )
+}
+
+p_te <- wrap_plots(plot_te, ncol = 2) +
+  plot_annotation(title = "Translation Efficiency")
+
+############################################################
+## Save
+############################################################
+
+ggsave(
+  filename = "TotalRNA_Wavelet2.pdf",
+  plot = p_total,
+  width = 18,
+  height = 49
+)
+
+ggsave(
+  filename = "TE_Wavelet2.pdf",
+  plot = p_te,
+  width = 18,
+  height = 49
+)
+
+############################################################
+## Display
+############################################################
+
+p_total
+p_te
