@@ -1,5 +1,6 @@
 source("/home/jinpu/R_project/plot_in_R/R/spaimpute_skill_0708.R")
-
+#this is for demo-states dataset , aiming to refine the functions so far.
+#you can use these to create demo datasets, also can see the data simulation method like scDesign2
 # 1.pseudomatrix-prepare --------------------------------------------------
 
 
