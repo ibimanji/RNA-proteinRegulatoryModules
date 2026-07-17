@@ -1,11 +1,15 @@
+#this is for the demo of SCMLbased SPAIMPUTATION and function refine
+#notice that this 'sampling' method may be risky since it is NOT suitable for the ZINB since we consider rare dropouts here.
+#ALSO we can later see: scDesign2.
+
 source("/home/jinpu/R_project/plot_in_R/R/spaimpute_skill_0708.R")
-#this is for demo-states dataset , aiming to refine the functions so far.
-#you can use these to create demo datasets, also can see the data simulation method like scDesign2
+#!!!!!ALSO LOAD THE FUNCTION IN THE LAST PART. "APPE"
 # 1.pseudomatrix-prepare --------------------------------------------------
 
 
 ngenes <- 40
 ncells <- 80
+
 genes <- paste0("Gene",1:ngenes)
 cells <- paste0("Cell",1:ncells)
 
@@ -20,34 +24,82 @@ celltype <- c(
 row <- numeric(ncells)
 column <- numeric(ncells)
 
+
+
+# ==========================
 # OLG1
+# random distribution
+# ==========================
+
 row[1:20] <-
-  sample(1:20,20)
+  runif(20, 1, 40)
 
 column[1:20] <-
-  sample(1:20,20)
+  runif(20, 1, 40)
 
+
+
+# ==========================
 # OLG2
-# 特定区域 domain
+# spatial domain
+# concentrated region
+# ==========================
+
 row[21:40] <-
-  sample(15:20,20,replace=TRUE)
+  rnorm(
+    20,
+    mean = 32,
+    sd = 3
+  )
 
 column[21:40] <-
-  sample(15:20,20,replace=TRUE)
+  rnorm(
+    20,
+    mean = 32,
+    sd = 3
+  )
 
+
+# 防止超出范围
+row[21:40] <-
+  pmin(
+    pmax(row[21:40],20),
+    40
+  )
+
+column[21:40] <-
+  pmin(
+    pmax(column[21:40],20),
+    40
+  )
+
+
+
+# ==========================
 # MLG
+# random distribution
+# ==========================
+
 row[41:60] <-
-  sample(1:20,20)
+  runif(20, 1, 40)
 
 column[41:60] <-
-  sample(1:20,20)
+  runif(20, 1, 40)
 
+
+
+# ==========================
 # AST
+# random distribution
+# ==========================
+
 row[61:80] <-
-  sample(1:20,20)
+  runif(20, 1, 40)
 
 column[61:80] <-
-  sample(1:20,20)
+  runif(20, 1, 40)
+
+
 
 meta <- data.frame(
   row=row,
@@ -56,7 +108,6 @@ meta <- data.frame(
   states_nn_alg1_label3=celltype,
   row.names=cells
 )
-
 
 OLG_marker <- c(
   "Gene1",
@@ -846,7 +897,7 @@ hist(
 
 
 W_spatial_orginal <- build_radius_graph(
-  coords=coords,radius = 3,
+  coords=coords,radius = 10,
   sigma_floor=1e-3
 )#可以改成delaunay
 rownames(W_spatial_orginal) <- colnames(states_demo)
@@ -854,33 +905,42 @@ colnames(W_spatial_orginal) <- colnames(states_demo)
 p_spatial_ori <- plot_graph_weight(
   W_spatial_orginal,
   states_demo@meta.data,
-  "Adaptive spatial graph_original",use_spatial=TRUE
+  "original radius graph, \n r = 10",use_spatial=TRUE
 )
 
 
 p_spatial_ori
 
-W_spatial_result <-
-  ReweightSpatialGraphAdaptive(
-    W_spatial=W_spatial_orginal,
-    Emb_rb=Emb_rb,
-    Emb_nt=Emb_nt,
-    gate_quantile=0.25,
-    beta_scale=1,
-    symmetrize="max"
-  )
+#2 methods for spatial enhance: (1) RNA layer enhance (2)considering spatial-neighborhood expressing
+W_spatial_refine = SpatialEnhanceRNAgraph_sparse(W_rna = W_rb,
+                                                 W_spatial_original = W_spatial_orginal,
+                                                 symmetrize = 'max',lambda = 2)
 
-W_spatial_refine <-
-  W_spatial_result$W
 p_spatial <- plot_graph_weight(
   W_spatial_refine,
   states_demo@meta.data,
-  "Adaptive spatial graph_refined",use_spatial=TRUE
+  "Adaptive spatial graph_refined",use_spatial=FALSE
 )
+p_rb|p_spatial
+
+
+neighbor_expr <- NeighborExpressionEmbedding(
+  W_spatial_orginal,
+  expr = t(rb_norm),
+  alpha=0.1
+)
+
+neighbor_pca <- prcomp(
+  neighbor_expr,
+  scale.=TRUE
+)$x[,1:10]
+
+W_neighbor <- build_knn_graph(k=10,sigma_nn=5,neighbor_pca)
+p_spatial <- plot_graph_weight(
+  W_neighbor,
+  states_demo@meta.data,
+  "Neighborhood graph_refined",use_spatial=FALSE)
 p_spatial
-
-
-
 
 
 ############################################################
@@ -890,11 +950,11 @@ scml_result <- run_scml_core( #存在scml_core_new,就是选取从"SM"改为"SA"
   graph_list=list(
     ntRNA=W_nt,
     rbRNA=W_rb,
-    spatial=W_spatial_refine
+    spatial=W_neighbor
   ),
   ndim=10,
   default_alpha=1,
-  spatial_alpha=0.2
+  spatial_alpha=0.5
 )
 
 scml_result$eigenvalues
@@ -917,28 +977,263 @@ p_U <- plot_graph_weight(
   "U graph",
   use_spatial=FALSE
 )
-p_U
+p_rb | p_U
+rownames(W_U)
 
-cell_colors <- c(
-  OLG1="#111111",
-  OLG2="#71B7B0",
-  MLG ="#F58518",
-  AST ="#54A24B"
+# 3. Uembedding UMAP scanning ----------------------------------------------
+
+
+dim(U_embedding)
+rownames(U_embedding) <- colnames(states_demo)
+
+DefaultAssay(states_demo) <- "RNA"
+states_demo <- FindNeighbors(
+  states_demo,
+  reduction="rna.pca",
+  dims=1:10,
+  graph.name="RNA_snn"
+)
+states_demo <- FindClusters(
+  states_demo,
+  graph.name="RNA_snn",
+  resolution=0.5
+)
+states_demo <- RunUMAP(
+  states_demo,
+  reduction="rna.pca",
+  dims=1:10,
+  reduction.name="rna.umap"
+)
+p1 <- DimPlot(
+  states_demo,
+  reduction="rna.umap",
+  group.by="states_nn_alg1_label3"
+)
+p1
+
+states_demo[["scml"]] <-
+  CreateDimReducObject(
+    embeddings = U_embedding,
+    key="SCML_",
+    assay="RNA"
+  )
+states_demo <- FindNeighbors(
+  states_demo,
+  reduction="scml",
+  dims=1:ncol(U_embedding),
+  k.param=10,
+  graph.name="SCML_snn"
+)
+states_demo <- FindClusters(
+  states_demo,
+  graph.name="SCML_snn",
+  resolution=0.5
+)
+states_demo <- RunUMAP(
+  states_demo,
+  reduction="scml",
+  dims=1:ncol(U_embedding),
+  reduction.name="scml.umap"
+)
+p2 <- DimPlot(
+  states_demo,
+  reduction="scml.umap",
+  group.by="states_nn_alg1_label3"
+)
+p1 + p2
+
+
+# 4. IMPUTATION -----------------------------------------------------------
+
+W <- BuildSCMLGraph(U_embedding, k=10, sigma_nn = 5)
+
+spec <- ComputeGraphSpectrum(
+  W,
+  n_eigs=10
 )
 
-plot(
-  U_embedding[,1],
-  U_embedding[,2],
-  col=cell_colors[celltype],
-  pch=16,
-  cex=1.5,
-  xlab="SCML1",
-  ylab="SCML2"
+lambda <- spec$lambda
+lambda
+V <- spec$V
+ord <- order(lambda)
+lambda_sort <- lambda[ord]
+V_sort <- V[, ord, drop = FALSE]
+g_heat <- GraphFilterKernel(
+  lambda_sort,
+  type = "heat",beta = 10,
+  plot = TRUE
 )
 
-legend(
-  "topright",
-  legend=names(cell_colors),
-  col=cell_colors,
-  pch=16
+rb_raw_mat = GetAssayData(states_demo, layer = 'counts', assay = 'rbRNA')
+total_raw_mat = GetAssayData(states_demo, layer  = 'counts', assay = 'RNA')
+nt_raw_mat = GetAssayData(states_demo, layer = 'counts', assay = 'ntRNA')
+
+total_norm <- GetAssayData(states_demo, layer = 'data',assay = 'RNA')
+rb_norm <- GetAssayData(states_demo, layer = 'data',assay = 'rbRNA')
+nt_norm <- GetAssayData(states_demo, layer = 'data',assay = 'ntRNA')
+
+
+rb_raw_f <- GraphWaveletDenoise(
+  expr = rb_raw_mat,
+  V = V_sort,
+  g = g_heat
 )
+colnames(rb_raw_f) <- colnames(rb_raw_mat)
+all.equal(rownames(rb_raw_f),rownames(rb_raw_mat))
+
+
+nt_raw_f <- GraphWaveletDenoise(
+  expr = nt_raw_mat,
+  V = V_sort,
+  g = g_heat
+)
+colnames(nt_raw_f) <- colnames(nt_raw_mat)
+all.equal(rownames(nt_raw_f),rownames(nt_raw_mat))
+
+total_raw_f <- GraphWaveletDenoise(
+  expr = total_raw_mat,
+  V = V_sort,
+  g = g_heat
+)
+colnames(total_raw_f) <- colnames(total_raw_mat)
+all.equal(rownames(total_raw_f),rownames(total_raw_mat))
+
+
+rb_norm_f <- GraphWaveletDenoise(
+  expr = rb_norm,
+  V = V_sort,
+  g = g_heat
+)
+colnames(rb_norm_f) <- colnames(rb_norm)
+all.equal(
+  rownames(rb_norm_f),
+  rownames(rb_norm)
+)
+
+
+nt_norm_f <- GraphWaveletDenoise(
+  expr = nt_norm,
+  V = V_sort,
+  g = g_heat
+)
+colnames(nt_norm_f) <- colnames(nt_norm)
+all.equal(
+  rownames(nt_norm_f),
+  rownames(nt_norm)
+)
+
+
+total_norm_f <- GraphWaveletDenoise(
+  expr = total_norm,
+  V = V_sort,
+  g = g_heat
+)
+colnames(total_norm_f) <- colnames(total_norm)
+all.equal(
+  rownames(total_norm_f),
+  rownames(total_norm)
+)
+
+
+states_demo[["total_wavelet"]] <-
+  CreateAssayObject(
+    counts = total_raw_f
+  )
+
+states_demo[["total_wavelet"]] <-
+  SetAssayData(
+    states_demo[["total_wavelet"]],
+    layer = "data",
+    new.data = total_norm_f
+  )
+
+states_demo[["rb_wavelet"]] <-
+  CreateAssayObject(
+    counts = rb_raw_f
+  )
+
+states_demo[["rb_wavelet"]] <-
+  SetAssayData(
+    states_demo[["rb_wavelet"]],
+    layer="data",
+    new.data=rb_norm_f
+  )
+
+
+states_demo[["nt_wavelet"]] <-
+  CreateAssayObject(
+    counts = nt_raw_f
+  )
+
+states_demo[["nt_wavelet"]] <-
+  SetAssayData(
+    states_demo[["nt_wavelet"]],
+    layer="data",
+    new.data=nt_norm_f
+  )
+
+DefaultAssay(states_demo) <- "rb_wavelet"
+
+
+FeaturePlot(
+  states_demo,
+  features=c("Gene6","Gene1","Gene11","Gene17","Gene29","Gene30"),
+  reduction="scml.umap"
+)
+
+rb_raw <- GetAssayData(
+  states_demo,
+  assay="rbRNA",
+  layer="data"
+)
+
+nt_raw <- GetAssayData(
+  states_demo,
+  assay="ntRNA",
+  layer="data"
+)
+TE_cell_raw <-
+  Matrix::colSums(rb_raw) /
+  (
+    Matrix::colSums(rb_raw) +
+      Matrix::colSums(nt_raw) +
+      1e-8
+  )
+
+rb_wave <- GetAssayData(
+  states_demo,
+  assay="rb_wavelet",
+  layer="data"
+)
+
+
+nt_wave <- GetAssayData(
+  states_demo,
+  assay="nt_wavelet",
+  layer="data"
+)
+TE_cell_wave <-
+  Matrix::colSums(rb_wave) /
+  (
+    Matrix::colSums(rb_wave) +
+      Matrix::colSums(nt_wave) +
+      1e-8
+  )
+states_demo$TE_raw <- TE_cell_raw
+states_demo$TE_wave <- TE_cell_wave
+
+p3 <- FeaturePlot(
+  states_demo,
+  features = "TE_raw",
+  reduction = "scml.umap",
+  cols = c("lightgrey", "darkred")
+) +
+  ggtitle("Raw TE")
+p4 <- FeaturePlot(
+  states_demo,
+  features = "TE_wave",
+  reduction = "scml.umap",
+  cols = c("lightgrey", "darkred")
+) +
+  ggtitle("Wavelet TE")
+p3 + p4
