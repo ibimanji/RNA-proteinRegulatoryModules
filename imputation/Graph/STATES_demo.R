@@ -1,7 +1,8 @@
 #this is for the demo of SCMLbased SPAIMPUTATION and function refine
 #notice that this 'sampling' method may be risky since it is NOT suitable for the ZINB since we consider rare dropouts here.
 #ALSO we can later see: scDesign2.
-
+#ALSO TE glance is in need for refining(p3 + p4 in the ~1000line), while TE-before and after imputation can be directly glance from the whole STATES-data, 
+#we shall pass here.
 source("/home/jinpu/R_project/plot_in_R/R/spaimpute_skill_0708.R")
 #!!!!!ALSO LOAD THE FUNCTION IN THE LAST PART. "APPE"
 # 1.pseudomatrix-prepare --------------------------------------------------
