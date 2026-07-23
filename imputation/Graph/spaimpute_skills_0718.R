@@ -657,6 +657,7 @@ NeighborExpressionEmbedding <- function(
     normalize = TRUE,
     alpha = 0.5
 ){
+  #现在主要的spatial利用来源
   deg <- Matrix::rowSums(W) #这个W是spatial original
   deg[deg==0] <- 1 #
   
@@ -725,7 +726,8 @@ ComputeGraphSpectrum<- function(
   
   list(
     lambda=eig$values,
-    V=eig$vectors
+    V=eig$vectors,
+    L = L
   )
 }
 
@@ -940,7 +942,7 @@ GraphFilterKernel <- function(
 ){
   
   ############################################################
-  ## If only requesting kernel (no plotting)
+  ##OLD VERSION HERE
   ############################################################
   
   if (is.null(lambda) && !plot) {
@@ -1060,26 +1062,195 @@ GraphFilterKernel <- function(
   
 }
 
-GraphWaveletDenoise <- function(
+GraphSpectralDenoise <- function(
     expr,
     V,
-    g
+    lambda,
+    g,
+    remove_dc = TRUE,
+    sort_lambda = TRUE,
+    add_dc = FALSE
 ){
   
-  g <- g
+  ################################################
+  ## expr: gene x cell, seurat 
+  ## V: cell x eigenvectors
+  ## lambda: eigenvalues
+  ## g:
+  ##   vector(length=lambda) 
+  ##   OR matrix(freq x gene)
+  ## THIS IS OLD!!!!!!!
+  ################################################
   
-  X <- t(as.matrix(expr))
   
-  X_hat <- t(V) %*% X
+  X <- t(as.matrix(expr))   # cell x gene
   
-  X_hat_filt <- g * X_hat
   
-  X_filt <- V %*% X_hat_filt
+  ################################################
+  ## sort eigen system
+  ################################################
   
-  X_filt[X_filt < 0] <- 0
+  if(sort_lambda){
+    
+    ord <- order(lambda)
+    
+    lambda <- lambda[ord]
+    V <- V[,ord,drop=FALSE]
+    
+  }
   
-  t(X_filt)
+  
+  ################################################
+  ## remove DC component
+  ################################################
+  
+  if(remove_dc){
+    
+    v0 <- V[,1,drop=FALSE]
+    
+    X_dc <- v0 %*% (t(v0)%*%X)
+    
+    X_spatial <- X - X_dc
+    cat(
+      "Spatial residual range:",
+      range(X_spatial),
+      "\n"
+    )
+    
+    V_use <- V[,-1,drop=FALSE] #drop the smallest lambda and its egi-vector
+    
+    cat("drop lambda: ",lambda[1],"\n")
+    
+    lambda_use <- lambda[-1]
+    
+  }else{
+    
+    X_dc <- matrix(
+      0,
+      nrow=nrow(X),
+      ncol=ncol(X)
+    )
+    
+    X_spatial <- X
+    
+    V_use <- V
+    lambda_use <- lambda
+    
+  }
+
+  
+  Xhat <- t(V_use)%*%X_spatial
+  
+  if(is.vector(g)){
+    
+    Xhat_filtered <- 
+      g * Xhat
+    
+    
+  }else{
+    
+    # gene-wise filter
+    
+    Xhat_filtered <-
+      g * Xhat
+    
+  }
+  
+  X_spatial_filtered <-
+    V_use %*% Xhat_filtered
+  
+  if(add_dc){
+    
+    X_filtered <-
+      X_dc + X_spatial_filtered
+    
+  }else{
+    
+    X_filtered <-
+      X_spatial_filtered
+    
+  }
+  
+  
+  X_filtered[X_filtered<0] <- 0
+  
+  
+  
+  out <- t(X_filtered)
+  
+  rownames(out) <- rownames(expr)
+  colnames(out) <- colnames(expr)
+  
+  
+  return(
+    list(
+      expr_filtered = out,
+      X_dc = t(X_dc),
+      X_spatial = t(X_spatial),
+      lambda = lambda_use,
+      V = V_use,
+      g = g
+    )
+  )
 }
+
+ComputeGeneWiseKernel <- function(
+    X_spatial,
+    L,
+    lambda,
+    beta_min = 1,
+    beta_max = 10
+){
+  
+  
+  ################################################
+  ## X_spatial:
+  ## cell x gene
+  ## when beta comes large, the high frequency gets low weight, like being killed
+  ################################################
+
+  
+  roughness <- apply(
+    X_spatial,
+    2,
+    function(x){
+      
+      as.numeric(
+        t(x)%*%L%*%x
+      ) /
+        (sum(x^2)+1e-8)
+      
+    }
+  )
+  
+  rough_scaled <-
+    (roughness-min(roughness))/
+    (max(roughness)-min(roughness)+1e-8)
+  
+  
+  # high roughness -> low beta
+  beta_gene <-
+    beta_max -
+    rough_scaled *
+    (beta_max-beta_min)
+  
+  
+  lambda_scaled <-
+    lambda/max(lambda)
+  
+  G <-
+    exp(
+      -lambda_scaled %o% beta_gene
+    )
+  return(
+    list(
+      beta_gene = beta_gene,
+      roughness = roughness,
+      G = G
+    )
+  )
+}
+
 
 resolve_layer_values_pan <- function(
     values,
@@ -1294,6 +1465,133 @@ run_scml_core_pan <- function(
     layer_weight = weight_vec
   )
 }#run_scml_core_pan(graph_list,alpha = c(A = i, ...), layer_weight = c(A = j, ...), ndims = ...)
+
+RunGeneWiseGraphFilter <- function(
+    expr,
+    V,
+    lambda,
+    L,
+    beta_min = 1,
+    beta_max = 10
+){
+  
+  X <- t(as.matrix(expr))
+  v0 <- V[,1,drop=FALSE]
+  X_dc <-
+    v0 %*% (t(v0)%*%X) #对于一个图的谱分解，第一特征值理论为0，以及其对应的特征向量v0为一个元素完全一致的列向量；X_dc这里可以理解为全局的平均表达水平，一种library size，该矩阵没有区分cell的能力
+  
+  
+  X_spatial <-
+    X-X_dc  #可以立即为细胞间差异、空间结构、domain signal
+  
+  
+  V_sp <- V[,-1,drop=FALSE]
+  lambda_sp <- lambda[-1]
+  
+  kernel <- ComputeGeneWiseKernel( 
+    X_spatial = X_spatial,
+    L = L,
+    lambda = lambda_sp,
+    beta_min = beta_min,
+    beta_max = beta_max
+  )#滤波器计算，这里尝试了gene-wise的特异滤波，如果不考虑gene特异，直接设置betamin = betamax
+  
+  Xhat <-
+    t(V_sp)%*%X_spatial
+  
+  
+  
+  Xhat_filtered <-
+    kernel$G * Xhat
+  
+  
+  X_spatial_filtered <-
+    V_sp %*% Xhat_filtered
+  
+  
+  
+  X_filtered <-
+    X_spatial_filtered
+  
+  
+  X_filtered[X_filtered<0] <- 0
+  
+  
+  
+  out <- t(X_filtered)
+  
+  
+  rownames(out)<-
+    rownames(expr)
+  
+  colnames(out)<-
+    colnames(expr)
+  
+  
+  
+  return(
+    list(
+      filtered = out,
+      beta_gene = kernel$beta_gene,
+      roughness = kernel$roughness,
+      G = kernel$G,
+      X_dc = t(X_dc),
+      X_spatial = t(X_spatial)
+    )
+  )
+}
+
+QuantileRescaleGene <- function(
+    expr_raw,#原来的矩阵，norm
+    expr_denoise,#去噪，插补完成的矩阵
+    q = 0.99
+){
+  
+  ## both:
+  ## gene x cell
+  
+  stopifnot(
+    all(dim(expr_raw)==dim(expr_denoise))
+  )
+  
+  
+  q_raw <- apply(
+    expr_raw,
+    1,
+    quantile,
+    probs=q,
+    na.rm=TRUE
+  )
+  
+  
+  q_denoise <- apply(
+    expr_denoise,
+    1,
+    quantile,
+    probs=q,
+    na.rm=TRUE
+  )
+  
+  
+  scale_factor <-
+    q_raw /
+    (q_denoise + 1e-8)
+  
+  
+  expr_rescale <-
+    expr_denoise *
+    scale_factor
+  
+  
+  return(
+    list(
+      expr = expr_rescale,
+      q_raw = q_raw,
+      q_denoise = q_denoise,
+      scale_factor = scale_factor
+    )
+  )
+}
 
 # 4. SpatialLayer_preprocessing -------------------------------------------
 
