@@ -28,6 +28,578 @@ row_normalize <- function(x, eps = 1e-10) {
   sweep(x, 1, denom, "/")
 }#function related to vector normalization of U_consensus in run_scml_core eig_vectors
 
+build_radius_graph <- function(
+    coords,
+    radius,
+    sigma_floor = 1e-6
+){
+  
+  coords <- as.matrix(coords)
+  
+  if(ncol(coords) != 2){
+    stop("coords must be an n × 2 matrix.")
+  }
+  
+  if(any(!is.finite(coords))){
+    stop("coords contains NA/NaN/Inf.")
+  }
+  
+  n <- nrow(coords)
+  
+  ########################################################
+  ## Pairwise distance
+  ########################################################
+  
+  D <- as.matrix(dist(coords))
+  
+  ########################################################
+  ## Radius neighbors
+  ########################################################
+  
+  idx <- which(
+    D <= radius &
+      D > 0,
+    arr.ind = TRUE
+  )
+  
+  ## 保留上三角
+  idx <- idx[idx[,1] < idx[,2], , drop = FALSE]
+  
+  if(nrow(idx) == 0){
+    stop("No edges found. Increase radius.")
+  }
+  
+  d <- D[idx]
+  
+  ########################################################
+  ## Local sigma
+  ########################################################
+  
+  sigma <- numeric(n)
+  
+  for(i in seq_len(n)){
+    
+    di <- D[i, ]
+    
+    di <- di[
+      di > 0 &
+        di <= radius
+    ]
+    
+    if(length(di) == 0){
+      
+      sigma[i] <- sigma_floor
+      
+    }else{
+      
+      sigma[i] <- median(di)
+      
+    }
+    
+  }
+  
+  sigma[sigma < sigma_floor] <- sigma_floor
+  
+  ########################################################
+  ## Adaptive Gaussian weight
+  ########################################################
+  
+  sigma_i <- sigma[idx[,1]]
+  sigma_j <- sigma[idx[,2]]
+  
+  w <- exp(
+    -(d^2) /
+      (sigma_i * sigma_j)
+  )
+  
+  ########################################################
+  ## Sparse adjacency
+  ########################################################
+  
+  W <- Matrix::sparseMatrix(
+    i = idx[,1],
+    j = idx[,2],
+    x = w,
+    dims = c(n, n)
+  )
+  
+  W <- pmax(W, Matrix::t(W))
+  
+  diag(W) <- 0
+  
+  Matrix::drop0(W)
+}
+
+build_radius_capped_knn_graph <- function(
+    coords,
+    k = 15,
+    radius = 500,
+    sigma_floor = 1e-6,
+    weight_mode = "adaptive_gaussian"
+){
+  
+  coords <- as.matrix(coords)
+  
+  if(ncol(coords) != 2){
+    stop("coords must be an n x 2 matrix.")
+  }
+  
+  if(any(!is.finite(coords))){
+    stop("coords contains NA/NaN/Inf.")
+  }
+  
+  n <- nrow(coords)
+  
+  if(n <= 1){
+    stop("At least two cells are required.")
+  }
+  
+  ########################################################
+  ## Pairwise distance
+  ########################################################
+  
+  D <- as.matrix(dist(coords))
+  
+  diag(D) <- Inf
+  
+  
+  ########################################################
+  ## Construct radius-capped kNN
+  ########################################################
+  
+  neighbor_list <- vector(
+    "list",
+    n
+  )
+  
+  distance_list <- vector(
+    "list",
+    n
+  )
+  
+  for(i in seq_len(n)){
+    
+    di <- D[i, ]
+    
+    ## only cells inside the maximum radius
+    candidate <- which(
+      is.finite(di) &
+        di <= radius
+    )
+    
+    if(length(candidate) == 0){
+      
+      neighbor_list[[i]] <- integer(0)
+      distance_list[[i]] <- numeric(0)
+      
+      next
+    }
+    
+    ## sort by distance
+    candidate <- candidate[
+      order(di[candidate])
+    ]
+    
+    ## keep at most k nearest neighbors
+    if(length(candidate) > k){
+      candidate <- candidate[seq_len(k)]
+    }
+    
+    neighbor_list[[i]] <-
+      candidate
+    
+    distance_list[[i]] <-
+      di[candidate]
+  }
+  
+  
+  ########################################################
+  ## Local adaptive sigma
+  ########################################################
+  
+  sigma <- numeric(n)
+  
+  for(i in seq_len(n)){
+    
+    di <- distance_list[[i]]
+    
+    if(length(di) == 0){
+      
+      sigma[i] <- sigma_floor
+      
+    } else {
+      
+      sigma[i] <- median(di)
+      
+    }
+  }
+  
+  sigma[
+    !is.finite(sigma) |
+      sigma < sigma_floor
+  ] <- sigma_floor
+  
+  
+  ########################################################
+  ## Build directed weights
+  ########################################################
+  
+  ii <- integer(0)
+  jj <- integer(0)
+  ww <- numeric(0)
+  
+  for(i in seq_len(n)){
+    
+    nb <- neighbor_list[[i]]
+    
+    if(length(nb) == 0){
+      next
+    }
+    
+    d <- distance_list[[i]]
+    
+    if(weight_mode == "uniform"){
+      
+      w <- rep(
+        1 / length(nb),
+        length(nb)
+      )
+      
+    } else if(weight_mode == "reciprocal"){
+      
+      w <- 1 / pmax(
+        d,
+        sigma_floor
+      )
+      
+      w <- w / sum(w)
+      
+    } else if(weight_mode == "adaptive_gaussian"){
+      
+      sigma_i <- sigma[i]
+      
+      w <- exp(
+        -d^2 /
+          (2 * sigma_i^2)
+      )
+      
+      w <- w / sum(w)
+      
+    } else {
+      
+      stop(
+        "Unknown weight_mode. ",
+        "Use 'uniform', 'reciprocal', ",
+        "or 'adaptive_gaussian'."
+      )
+    }
+    
+    ii <- c(
+      ii,
+      rep(i, length(nb))
+    )
+    
+    jj <- c(
+      jj,
+      nb
+    )
+    
+    ww <- c(
+      ww,
+      w
+    )
+  }
+  
+  
+  ########################################################
+  ## Sparse row-normalized adjacency
+  ########################################################
+  
+  W <- Matrix::sparseMatrix(
+    i = ii,
+    j = jj,
+    x = ww,
+    dims = c(n, n)
+  )
+  
+  diag(W) <- 0
+  
+  W <- Matrix::drop0(W)
+  
+  
+  ########################################################
+  ## Neighbor number summary
+  ########################################################
+  
+  neighbor_n <- lengths(neighbor_list)
+  
+  n_target <- sum(
+    neighbor_n == k
+  )
+  
+  n_less <- sum(
+    neighbor_n < k
+  )
+  
+  cat("\n")
+  cat("========================================\n")
+  cat("Radius-capped kNN neighbor summary\n")
+  cat("========================================\n")
+  
+  cat(
+    "Target neighbors per cell:",
+    k,
+    "\n"
+  )
+  
+  cat(
+    "Maximum radius:",
+    radius,
+    "\n"
+  )
+  
+  cat(
+    "Cells with target number of neighbors:",
+    n_target,
+    "/",
+    n,
+    sprintf(
+      "(%.2f%%)",
+      100 * n_target / n
+    ),
+    "\n"
+  )
+  
+  cat(
+    "Cells with fewer than target neighbors:",
+    n_less,
+    "/",
+    n,
+    sprintf(
+      "(%.2f%%)",
+      100 * n_less / n
+    ),
+    "\n"
+  )
+  
+  if(n_less > 0){
+    
+    cat(
+      "Neighbor number summary for cells with fewer than",
+      k,
+      "neighbors:\n"
+    )
+    
+    print(
+      summary(
+        neighbor_n[
+          neighbor_n < k
+        ]
+      )
+    )
+    
+  } else {
+    
+    cat(
+      "All cells reached the target number of neighbors.\n"
+    )
+    
+  }
+  
+  cat(
+    "Overall neighbor-number summary:\n"
+  )
+  
+  print(
+    summary(neighbor_n)
+  )
+  
+  cat(
+    "========================================\n\n"
+  )
+  
+  
+  return(W)
+}
+
+
+build_knn_graph_bandwidth_with_largest_jaccards <- function(
+    emb,
+    k = 30,
+    sigma_nn = 20,
+    symmetrize = c("max", "mean"),
+    sigma_floor = 1e-6
+){
+  
+  symmetrize <- match.arg(symmetrize)
+  
+  emb <- as.matrix(emb)
+  
+  if (nrow(emb) <= k)
+    stop("k must be smaller than number of cells.")
+  
+  if(any(!is.finite(emb)))
+    stop("Embedding contains NA/NaN/Inf.")
+  
+  ############################################################
+  ## kNN
+  ############################################################
+  
+  knn <- FNN::get.knn(emb, k = k)
+  
+  idx <- knn$nn.index
+  dst <- knn$nn.dist
+  
+  n <- nrow(idx)
+  
+  ############################################################
+  ## Neighbor list
+  ############################################################
+  
+  nbr <- lapply(seq_len(n), function(i) idx[i, ])
+  
+  ############################################################
+  ## Adaptive sigma
+  ############################################################
+  
+  sigma <- numeric(n)
+  
+  for(i in seq_len(n)){
+    
+    ########################################################
+    ## candidate cells:
+    ## neighbors + neighbors-of-neighbors
+    ########################################################
+    
+    cand <- unique(c(
+      nbr[[i]],
+      unlist(nbr[nbr[[i]]])
+    ))
+    
+    cand <- setdiff(cand, i)
+    
+    if(length(cand)==0){
+      
+      sigma[i] <- dst[i,k]
+      
+      next
+    }
+    
+    ########################################################
+    ## Jaccard
+    ########################################################
+    
+    Ni <- nbr[[i]]
+    
+    js <- numeric(length(cand))
+    
+    for(m in seq_along(cand)){
+      
+      j <- cand[m]
+      
+      Nj <- nbr[[j]]
+      
+      inter <- length(intersect(Ni, Nj))
+      
+      if(inter==0){
+        
+        js[m] <- 0
+        
+      }else{
+        
+        uni <- length(union(Ni, Nj))
+        
+        js[m] <- inter / uni
+        
+      }
+    }
+    
+    ########################################################
+    ## non-zero Jaccard
+    ########################################################
+    
+    keep <- which(js > 0)
+    
+    if(length(keep)==0){
+      
+      sigma[i] <- dst[i,k]
+      
+      next
+    }
+    
+    cand <- cand[keep]
+    js <- js[keep]
+    
+    ########################################################
+    ## Euclidean distance
+    ########################################################
+    
+    d <- sqrt(
+      rowSums(
+        (emb[cand,,drop=FALSE] -
+           matrix(
+             emb[i,],
+             nrow=length(cand),
+             ncol=ncol(emb),
+             byrow=TRUE
+           ))^2
+      )
+    )
+    
+    ########################################################
+    ## LARGEST!!!!!!!!!!!! Jaccard!!!!!!!!!
+    ########################################################
+    
+    ord <- order(-js, d) 
+    
+    cand <- cand[ord]
+    d <- d[ord]
+    js <- js[ord]
+    
+    ########################################################
+    ## choose sigma_nn cells
+    ########################################################
+    
+    m <- min(sigma_nn, length(cand))
+    
+    sigma[i] <- mean(d[1:m])
+    
+  }
+  
+  sigma[sigma < sigma_floor] <- sigma_floor
+  
+  ############################################################
+  ## Gaussian weight
+  ############################################################
+  
+  ii <- rep(seq_len(n), each = k)
+  jj <- as.vector(t(idx))
+  d  <- as.vector(t(dst))
+  
+  sigma_i <- rep(sigma, each = k)
+  sigma_j <- sigma[jj]
+  
+  w <- exp(-(d^2)/(sigma_i * sigma_j))
+  
+  ############################################################
+  ## Sparse graph
+  ############################################################
+  
+  W <- Matrix::sparseMatrix(
+    i = ii,
+    j = jj,
+    x = w,
+    dims = c(n,n)
+  )
+  
+  W <- switch(
+    symmetrize,
+    max = pmax(W, t(W)),
+    mean = (W + t(W)) / 2
+  )
+  diag(W) <- 0
+  drop0(W)
+}
 
 # 1. Neighbor_embedding ---------------------------------------------------
 
